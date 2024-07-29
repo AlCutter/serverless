@@ -27,6 +27,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 
 	"github.com/transparency-dev/serverless-log/api/layout"
 	"github.com/transparency-dev/serverless-log/client"
@@ -219,37 +220,16 @@ func (w *LogWriter) Run(ctx context.Context) {
 		}
 		newLeaf := w.gen()
 
-		req, err := http.NewRequest(http.MethodPost, w.u.String(), bytes.NewReader(newLeaf))
+		respBody, err := sendRequest(ctx, http.MethodPost, w.u.String(), bytes.NewReader(newLeaf))
 		if err != nil {
-			w.errchan <- fmt.Errorf("failed to create request: %v", err)
-			continue
+			w.errchan <- err
+			break
 		}
-		if len(*bearerToken) > 0 {
-			req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", *bearerToken))
-		}
-		resp, err := hc.Do(req.WithContext(ctx))
-		if err != nil {
-			w.errchan <- fmt.Errorf("failed to write leaf: %v", err)
-			continue
-		}
-		body, err := io.ReadAll(resp.Body)
-		_ = resp.Body.Close()
-		if err != nil {
-			w.errchan <- fmt.Errorf("failed to read body: %v", err)
-			continue
-		}
-		if resp.StatusCode != http.StatusOK {
-			w.errchan <- fmt.Errorf("write leaf was not OK. Status code: %d. Body: %q", resp.StatusCode, body)
-			continue
-		}
-		if resp.Request.Method != http.MethodPost {
-			w.errchan <- fmt.Errorf("write leaf was redirected to %s", resp.Request.URL)
-			continue
-		}
-		parts := bytes.Split(body, []byte("\n"))
+
+		parts := bytes.Split(respBody, []byte("\n"))
 		index, err := strconv.Atoi(string(parts[0]))
 		if err != nil {
-			w.errchan <- fmt.Errorf("write leaf failed to parse response: %v", body)
+			w.errchan <- fmt.Errorf("write leaf failed to parse response: %v", respBody)
 			continue
 		}
 
@@ -259,6 +239,53 @@ func (w *LogWriter) Run(ctx context.Context) {
 		}
 		klog.V(2).Infof("Wrote leaf at index %d", index)
 	}
+}
+
+func sendRequest(ctx context.Context, method string, url string, postData io.Reader) ([]byte, error) {
+	req, err := http.NewRequest(method, url, postData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %v", err)
+	}
+	if len(*bearerToken) > 0 {
+		req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", *bearerToken))
+	}
+	resp, err := hc.Do(req.WithContext(ctx))
+	if err != nil {
+		return nil, fmt.Errorf("failed to write leaf: %v", err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read body: %v", err)
+	}
+	switch resp.StatusCode {
+	case http.StatusServiceUnavailable, http.StatusBadGateway, http.StatusGatewayTimeout:
+		retryDelay(resp.Header.Get("RetryAfter"), time.Second)
+		return body, fmt.Errorf("log not available. Status code: %d. Body: %q", resp.StatusCode, body)
+	case http.StatusOK:
+		break
+	default:
+		return body, fmt.Errorf("write leaf was not OK. Status code: %d. Body: %q", resp.StatusCode, body)
+	}
+	if resp.Request.Method != http.MethodPost {
+		return body, fmt.Errorf("write leaf was redirected to %s", resp.Request.URL)
+	}
+	return body, nil
+}
+
+func retryDelay(retryAfter string, defaultDur time.Duration) time.Duration {
+	if retryAfter == "" {
+		return defaultDur
+	}
+	d, err := time.Parse(http.TimeFormat, retryAfter)
+	if err == nil {
+		return time.Until(d)
+	}
+	s, err := strconv.Atoi(retryAfter)
+	if err == nil {
+		return time.Duration(s) * time.Second
+	}
+	return defaultDur
 }
 
 // Kills this writer at the next opportune moment.
